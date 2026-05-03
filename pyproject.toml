@@ -1,0 +1,23 @@
+[project]
+name = "radio-to-discord"
+version = "0.1.0"
+description = "VE-PG4 (ICOM RoIP Gateway) ↔ Discord voice channel bridge"
+requires-python = ">=3.11"
+dependencies = [
+    "discord.py[voice]>=2.4",
+    "discord-ext-voice-recv>=0.5.0",
+    "PyNaCl>=1.5",
+    "numpy>=1.26",
+    "scipy>=1.11",
+]
+
+[project.scripts]
+radio-discord-bridge = "radio_discord_bridge.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["radio_discord_bridge*"]
