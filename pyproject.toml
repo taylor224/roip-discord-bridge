@@ -4,11 +4,17 @@ version = "0.1.0"
 description = "VE-PG4 (ICOM RoIP Gateway) ↔ Discord voice channel bridge"
 requires-python = ">=3.11"
 dependencies = [
-    "discord.py[voice]>=2.4",
-    "discord-ext-voice-recv>=0.5.0",
+    "discord.py[voice]>=2.7",
+    # Upstream voice-recv on PyPI does NOT decrypt DAVE-encrypted audio (which
+    # Discord enforces since March 2026). PR #54 by @rdphillips7 adds DAVE
+    # decryption. Until that PR is merged and released on PyPI, install the
+    # fork directly from GitHub.
+    # See: https://github.com/imayhaveborkedit/discord-ext-voice-recv/pull/54
+    "discord-ext-voice-recv @ git+https://github.com/rdphillips7/discord-ext-voice-recv.git@main",
     "PyNaCl>=1.5",
     "numpy>=1.26",
     "scipy>=1.11",
+    "python-dotenv>=1.0",
 ]
 
 [project.scripts]

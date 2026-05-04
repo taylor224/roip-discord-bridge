@@ -40,6 +40,12 @@ class Config:
     # "mix":  all simultaneous speakers are sum-mixed into one RTP stream.
     discord_mix_mode: str = _str("BRIDGE_DISCORD_MIX_MODE", "fcfs")
 
+    # ────── Discord receive (RX) toggle ──────
+    # When upstream voice-recv is broken (e.g. Discord voice gateway v8 issues),
+    # set this to "0" / "false" to run TX-only — radio audio still reaches Discord
+    # but Discord users can't talk back into the radio.
+    discord_rx_enabled: bool = _str("BRIDGE_DISCORD_RX_ENABLED", "1").lower() not in ("0", "false", "no", "off")
+
     # ────── Audio ──────
     g711_sample_rate: int = 8000
     discord_sample_rate: int = 48000

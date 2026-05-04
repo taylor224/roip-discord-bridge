@@ -56,11 +56,14 @@ pip install -e .
 # Configure
 cp .env.example .env
 # Edit .env — fill in DISCORD_BOT_TOKEN, GUILD_ID, VOICE_CHANNEL_ID
-export $(cat .env | xargs)
 
-# Run
+# Run — .env in the current directory is auto-loaded via python-dotenv
 python -m radio_discord_bridge
 ```
+
+> Already-set environment variables take precedence; `.env` only fills missing
+> values. To force `.env` to override the shell, edit `__main__.py` to call
+> `load_dotenv(override=True)`.
 
 ### Windows
 
@@ -76,22 +79,13 @@ New-NetFirewallRule -DisplayName "RadioBridge UDP 22510" `
 New-NetFirewallRule -DisplayName "RadioBridge UDP 22511" `
     -Direction Inbound -Protocol UDP -LocalPort 22511 -Action Allow
 
-# Load .env into the current process
-Get-Content .env | ForEach-Object {
-    if ($_ -match '^([^#=]+)=(.*)$') {
-        [Environment]::SetEnvironmentVariable($matches[1].Trim(), $matches[2].Trim(), 'Process')
-    }
-}
-
-# If the host has multiple NICs (or a VPN), pin the outgoing IP that's on the
-# same LAN as the VE-PG4
+# If the host has multiple NICs (or a VPN), pin the outgoing IP that is on the
+# same LAN as the VE-PG4 (overrides .env if set in the shell)
 $env:BRIDGE_MCAST_IFACE_IP = "192.168.X.Y"
 
-# Run
+# Run — .env in the current directory is auto-loaded
 python -m radio_discord_bridge
 ```
-
-In `cmd.exe`, use `set DISCORD_BOT_TOKEN=...` instead of PowerShell syntax.
 
 ### Docker
 
@@ -125,6 +119,7 @@ docker run --rm \
 | `BRIDGE_RTCP_INTERVAL_S` | `5` | RTCP send interval (seconds) |
 | `BRIDGE_PTT_IDLE_RELEASE_MS` | `800` | PTT auto-release silence threshold (ms) |
 | `BRIDGE_DISCORD_MIX_MODE` | `fcfs` | Multi-speaker policy. `fcfs` = only the first speaker is forwarded; `mix` = all simultaneous speakers are sum-mixed into one stream. |
+| `BRIDGE_DISCORD_RX_ENABLED` | `1` | When `0` / `false`, run TX-only (no Discord → radio receive). Workaround for upstream voice-recv issues. |
 
 ## Architecture
 
@@ -138,16 +133,35 @@ docker run --rm \
 | `rtp.py` | RTP / RTCP build/parse (VE-PG4 compatible) |
 | `multicast.py` | Multicast socket helper (IGMP join) |
 | `ptt.py` | FCFS PTT state machine |
-| `discord_bot.py` | Discord bot client + voice receive sink + live PCM AudioSource |
+| `discord_bot.py` | Discord bot client (discord.py + voice-recv) + voice-receive sink + live PCM AudioSource + voice-recv monkey-patch |
 | `mixer.py` | Per-user PCM frame buffer + sum-mix (used when `BRIDGE_DISCORD_MIX_MODE=mix`) |
 | `bridge.py` | Orchestrator |
 
 ## Dependencies
 
-- **discord.py 2.4+** with `voice` extras (PyNaCl + opuslib)
-- **discord-ext-voice-recv** — real-time per-user voice receive
+- **discord.py 2.7+** with `voice` extras (DAVE / PyNaCl / opuslib)
+- **discord-ext-voice-recv (DAVE-patched fork)** — real-time per-user voice receive
 - **numpy / scipy** — resampling
+- **python-dotenv** — auto-loads `.env`
 - System: `libopus`, `libsodium`
+
+> **Note on Discord DAVE (E2EE) enforcement, March 2026+**
+>
+> Discord now requires end-to-end encryption (DAVE protocol) for all voice
+> connections. discord.py 2.7+ handles DAVE at the connection layer, but the
+> upstream `discord-ext-voice-recv` on PyPI does not decrypt the DAVE-wrapped
+> Opus payload — you would see `OpusError: corrupted stream` on every
+> received packet.
+>
+> This project pins voice-recv to the
+> [`rdphillips7/discord-ext-voice-recv`](https://github.com/rdphillips7/discord-ext-voice-recv)
+> fork, which adds DAVE decryption (open PR
+> [#54](https://github.com/imayhaveborkedit/discord-ext-voice-recv/pull/54)).
+> Once that PR merges and is released to PyPI, the dependency can be switched
+> back to the regular `discord-ext-voice-recv` package.
+>
+> If the receive path still misbehaves, set `BRIDGE_DISCORD_RX_ENABLED=0` to
+> run a TX-only bridge (radio → Discord works, Discord → radio is disabled).
 
 ## VE-PG4 prerequisite
 

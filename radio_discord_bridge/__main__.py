@@ -1,11 +1,24 @@
 """Entry point: `python -m radio_discord_bridge` or `radio-discord-bridge`."""
 import asyncio
 import logging
+import os
 import signal
 import sys
+from pathlib import Path
 
-from .bridge import Bridge
-from .config import Config
+from dotenv import load_dotenv, find_dotenv
+
+# Search for .env in: cwd (and parents), then alongside the package's parent
+# directory (project root). Windows-friendly because we use Path, not shell
+# globbing, and we log the resolved path for easy debugging.
+_PACKAGE_DIR = Path(__file__).resolve().parent
+_CANDIDATES = [
+    find_dotenv(usecwd=True),  # walks up from cwd
+    str(_PACKAGE_DIR.parent / ".env"),  # project root next to the package
+    str(_PACKAGE_DIR / ".env"),  # inside the package itself
+]
+_dotenv_path = next((p for p in _CANDIDATES if p and Path(p).is_file()), None)
+_loaded = bool(_dotenv_path) and load_dotenv(_dotenv_path, override=False)
 
 
 def main() -> int:
@@ -14,6 +27,18 @@ def main() -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     log = logging.getLogger("radio_discord_bridge")
+    if _loaded:
+        log.info(".env loaded from: %s", _dotenv_path)
+    else:
+        log.warning(
+            ".env not found (cwd=%s) — using process env. Searched: %s",
+            os.getcwd(),
+            [p for p in _CANDIDATES if p],
+        )
+
+    # Import after dotenv load so Config dataclass defaults pick up the values.
+    from .bridge import Bridge
+    from .config import Config
 
     cfg = Config()
     cfg.validate()
@@ -24,9 +49,11 @@ def main() -> int:
         cfg.mcast_group, cfg.rtp_port, cfg.our_ssrc,
     )
 
-    bridge = Bridge(cfg)
-
     async def runner():
+        # py-cord's discord.Client.__init__() calls asyncio.get_event_loop(),
+        # which on Python 3.14 raises if no running loop. Construct here.
+        bridge = Bridge(cfg)
+
         loop = asyncio.get_running_loop()
         stop = asyncio.Event()
 

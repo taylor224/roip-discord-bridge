@@ -2,11 +2,23 @@
 Discord bot — auto-joins a fixed voice channel, exposes a voice-receive sink,
 and a live-PCM AudioSource for outbound audio.
 
+Implementation: discord.py 2.7 + `discord-ext-voice-recv` for real-time per-user
+voice receive.
+
+Important: Discord enforces DAVE end-to-end encryption since March 2026.
+Upstream `discord-ext-voice-recv` on PyPI does not yet decrypt DAVE-encrypted
+audio (you'll get `OpusError: corrupted stream`). Until upstream PR #54 ships
+to PyPI, install voice-recv from the fork at
+https://github.com/rdphillips7/discord-ext-voice-recv (already pinned in
+pyproject.toml). The fork integrates DAVE decryption into the packet pipeline,
+so no additional patching is required here.
+
 Behavior:
   - On startup, joins the configured guild + voice channel.
-  - Uses voice-recv extension's AudioSink to receive per-user PCM (48 kHz stereo s16).
-  - StreamingPcmSource pushes radio audio to the channel as a live PCM stream.
-  - On voice disconnect, retries after 5 s.
+  - Outbound: StreamingPcmSource pushes radio audio to the channel.
+  - Inbound (optional, RX_ENABLED): RadioSink hands per-user 48 kHz stereo PCM
+    frames to a callback.
+  - On disconnect, retries after 5 s.
 """
 import asyncio
 import logging
@@ -18,18 +30,13 @@ from discord.ext import voice_recv
 
 log = logging.getLogger(__name__)
 
-# Discord voice frame size (20 ms @ 48 kHz stereo s16) = 3840 bytes
+# 20 ms @ 48 kHz stereo s16 = 3840 bytes
 FRAME_BYTES = 3840
 SILENCE_FRAME = b"\x00" * FRAME_BYTES
 
 
 class StreamingPcmSource(discord.AudioSource):
-    """
-    Bridges a live PCM queue to Discord's outbound audio frames.
-    Discord's internal audio thread calls read() every 20 ms — that call is
-    synchronous and must return immediately. push() (called from the asyncio
-    loop) feeds frames into the queue.
-    """
+    """Bridges a live PCM queue to Discord's outbound audio frames (20 ms cadence)."""
 
     def __init__(self, max_queue: int = 50):
         self._q: "queue.Queue[bytes]" = queue.Queue(maxsize=max_queue)
@@ -44,12 +51,19 @@ class StreamingPcmSource(discord.AudioSource):
         try:
             self._q.put_nowait(pcm_3840)
         except queue.Full:
-            # Avoid latency build-up — drop the oldest frame.
             try:
                 self._q.get_nowait()
                 self._q.put_nowait(pcm_3840)
             except queue.Empty:
                 pass
+
+    def clear(self) -> None:
+        """Drain pending frames — used when transitioning radio→idle to avoid stale audio."""
+        while True:
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                return
 
     def read(self) -> bytes:
         if self._closed:
@@ -67,35 +81,46 @@ class StreamingPcmSource(discord.AudioSource):
 
 
 class RadioSink(voice_recv.AudioSink):
-    """
-    Discord → radio direction. Forwards each user's 20 ms PCM frame via callback.
-    write() runs on Discord's internal audio thread.
-    """
+    """Per-user 20 ms PCM frame → callback (called on Discord's internal thread)."""
 
     def __init__(self, on_frame: Callable[[int, bytes], None]):
         super().__init__()
         self._on_frame = on_frame
+        self._null_source_logged = False
+        self._packet_count = 0
 
     def wants_opus(self) -> bool:
-        return False  # we want PCM s16 48 kHz stereo
+        return False
 
     def write(self, source, data: voice_recv.VoiceData) -> None:
-        # source: Member or None (unknown SSRC)
-        # data.pcm: 48 kHz stereo s16 (3840 bytes)
+        self._packet_count += 1
+        if self._packet_count in (1, 10, 100):
+            log.info("RadioSink.write: packet #%d source=%s pcm_len=%d",
+                     self._packet_count,
+                     getattr(source, "id", None),
+                     len(getattr(data, "pcm", b"") or b""))
+
         if source is None:
+            if not self._null_source_logged:
+                log.warning(
+                    "RadioSink: received audio packet with source=None — "
+                    "Discord SSRC→user mapping not yet established (SPEAKING event missing). "
+                    "Audio will be dropped until the mapping arrives."
+                )
+                self._null_source_logged = True
             return
-        self._on_frame(source.id, data.pcm)
+
+        pcm = getattr(data, "pcm", None)
+        if not pcm:
+            return
+        self._on_frame(source.id, pcm)
 
     def cleanup(self) -> None:
         pass
 
 
 class DiscordBridgeClient(discord.Client):
-    """
-    Bot that auto-joins a fixed guild + voice channel.
-      on_voice_frame(user_id, pcm_3840): external callback when a user's frame arrives.
-      audio_source: external StreamingPcmSource where the bridge pushes radio audio.
-    """
+    """Bot that auto-joins a fixed guild + voice channel."""
 
     def __init__(
         self,
@@ -103,6 +128,7 @@ class DiscordBridgeClient(discord.Client):
         voice_channel_id: int,
         on_voice_frame: Callable[[int, bytes], None],
         audio_source: StreamingPcmSource,
+        rx_enabled: bool = True,
     ):
         intents = discord.Intents.default()
         intents.voice_states = True
@@ -113,16 +139,15 @@ class DiscordBridgeClient(discord.Client):
         self.voice_channel_id = voice_channel_id
         self._on_voice_frame = on_voice_frame
         self._audio_source = audio_source
+        self._rx_enabled = rx_enabled
 
         self.voice_client: Optional[voice_recv.VoiceRecvClient] = None
-        self._reconnect_task: Optional[asyncio.Task] = None
 
     async def on_ready(self) -> None:
         log.info("Discord bot ready: %s (id=%s)", self.user, self.user.id if self.user else "?")
         await self._ensure_voice_connection()
 
     async def on_voice_state_update(self, member, before, after) -> None:
-        # If the bot itself was disconnected from voice, reconnect.
         if self.user is None or member.id != self.user.id:
             return
         if before.channel and not after.channel:
@@ -140,33 +165,38 @@ class DiscordBridgeClient(discord.Client):
             log.error("voice channel not found or not a VoiceChannel: %s", self.voice_channel_id)
             return
 
-        # Already connected — skip.
         if self.voice_client and self.voice_client.is_connected():
             return
 
         try:
             log.info("joining voice channel: guild=%s channel=%s", guild.name, channel.name)
-            self.voice_client = await channel.connect(cls=voice_recv.VoiceRecvClient, timeout=20.0)
+            cls = voice_recv.VoiceRecvClient if self._rx_enabled else discord.VoiceClient
+            self.voice_client = await channel.connect(cls=cls, timeout=20.0)
         except Exception as e:
             log.error("voice connect failed: %s", e)
             await asyncio.sleep(5)
             asyncio.create_task(self._ensure_voice_connection())
             return
 
-        # Start outbound audio — live PCM source.
+        # Outbound — live PCM source. Start paused so the bot doesn't appear
+        # as continuously speaking; bridge resumes it when radio audio arrives.
         if not self.voice_client.is_playing():
             self.voice_client.play(self._audio_source)
+            self.voice_client.pause()
 
-        # Start receiving — per-user frame callback.
-        sink = RadioSink(self._on_voice_frame)
-        self.voice_client.listen(sink)
-
-        log.info("voice ready — playing live source + listening per-user")
+        # Inbound — only if enabled.
+        if self._rx_enabled and isinstance(self.voice_client, voice_recv.VoiceRecvClient):
+            sink = RadioSink(self._on_voice_frame)
+            self.voice_client.listen(sink)
+            log.info("voice ready — playing live source + listening per-user (RX enabled)")
+        else:
+            log.info("voice ready — playing live source (RX disabled — TX-only mode)")
 
     async def shutdown(self) -> None:
         if self.voice_client:
             try:
-                self.voice_client.stop_listening()
+                if isinstance(self.voice_client, voice_recv.VoiceRecvClient):
+                    self.voice_client.stop_listening()
                 self.voice_client.stop()
                 await self.voice_client.disconnect(force=True)
             except Exception:

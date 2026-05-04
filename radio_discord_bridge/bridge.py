@@ -70,9 +70,14 @@ class Bridge:
             voice_channel_id=cfg.discord_voice_channel_id,
             on_voice_frame=self._on_discord_voice_frame,
             audio_source=self.audio_source,
+            rx_enabled=cfg.discord_rx_enabled,
         )
 
-        log.info("multi-speaker policy: %s", cfg.discord_mix_mode)
+        log.info(
+            "multi-speaker policy: %s  RX: %s",
+            cfg.discord_mix_mode,
+            "enabled" if cfg.discord_rx_enabled else "disabled (TX-only)",
+        )
 
     # ── Discord → Radio (TX) ─────────────────────────────────────────────
     def _on_discord_voice_frame(self, user_id: int, pcm_stereo_48k: bytes) -> None:
@@ -80,6 +85,13 @@ class Bridge:
         20 ms frame from a Discord user (called on Discord's internal thread).
         Routes to FCFS path or MIX path based on cfg.discord_mix_mode.
         """
+        # Log first frame per user (rate-limit) for debugging.
+        if not hasattr(self, "_seen_users"):
+            self._seen_users = set()
+        if user_id not in self._seen_users:
+            self._seen_users.add(user_id)
+            log.info("discord voice frame received from user_id=%d (len=%d)", user_id, len(pcm_stereo_48k))
+
         if len(pcm_stereo_48k) != FRAME_BYTES:
             return
 
@@ -126,6 +138,15 @@ class Bridge:
         except OSError as e:
             log.warning("rtp send failed: %s", e)
 
+        # Debug: log first packet + every 50th to confirm we're actually sending.
+        self._tx_packet_count = getattr(self, "_tx_packet_count", 0) + 1
+        if self._tx_packet_count in (1, 50, 100):
+            log.info(
+                "→ radio RTP #%d sent: seq=%d ssrc=0x%08x dst=%s:%d ulaw_len=%d",
+                self._tx_packet_count, self._tx_seq, self.cfg.our_ssrc,
+                self.cfg.mcast_group, self.cfg.rtp_port, len(ulaw),
+            )
+
         self._tx_seq = (self._tx_seq + 1) & 0xFFFF
         self._tx_ts = (self._tx_ts + self.cfg.g711_samples_per_frame) & 0xFFFFFFFF
 
@@ -159,7 +180,11 @@ class Bridge:
             with self._ptt_lock:
                 holder = self.ptt.holder
                 if holder is Holder.RADIO:
+                    if not getattr(self, "_radio_block_logged", False):
+                        log.info("mix_send_loop: blocked by RADIO holder — dropping discord audio")
+                        self._radio_block_logged = True
                     continue
+                self._radio_block_logged = False
                 if not self.ptt.acquire(Holder.DISCORD):
                     continue
                 self.ptt.touch(Holder.DISCORD)
@@ -196,6 +221,14 @@ class Bridge:
 
             self.audio_source.push(stereo)
 
+            # Resume Discord playback now that radio is actively speaking.
+            vc = self.discord_client.voice_client
+            if vc is not None and vc.is_connected() and vc.is_paused():
+                try:
+                    vc.resume()
+                except Exception as e:
+                    log.warning("voice resume failed: %s", e)
+
     # ── RTCP keepalive ─────────────────────────────────────────────────
     async def _rtcp_keepalive_loop(self) -> None:
         cname = self.cfg.rtcp_cname.encode()
@@ -209,15 +242,32 @@ class Bridge:
 
     # ── PTT idle watchdog ─────────────────────────────────────────────
     async def _ptt_watchdog_loop(self) -> None:
-        """When the PTT gate releases (idle), clear per-mode side state."""
+        """
+        When the PTT gate releases (idle), clear per-mode side state. When the
+        radio side specifically releases (RADIO → IDLE), also pause Discord
+        playback and drain pending PCM so the bot stops appearing as speaking.
+        """
         check_s = self.cfg.ptt_idle_release_ms / 1000 / 2
+        prev_holder = Holder.IDLE
         while True:
             await asyncio.sleep(check_s)
             with self._ptt_lock:
-                if self.ptt.holder is Holder.IDLE:
+                holder = self.ptt.holder
+                if holder is Holder.IDLE:
                     self._discord_speaker_id = None
                     if self._mixer is not None:
                         self._mixer.clear()
+
+            # RADIO → IDLE transition: pause TX to Discord and drop stale frames.
+            if prev_holder is Holder.RADIO and holder is Holder.IDLE:
+                self.audio_source.clear()
+                vc = self.discord_client.voice_client
+                if vc is not None and vc.is_connected() and vc.is_playing():
+                    try:
+                        vc.pause()
+                    except Exception as e:
+                        log.warning("voice pause failed: %s", e)
+            prev_holder = holder
 
     # ── Main ──────────────────────────────────────────────────────────
     async def run(self) -> None:
