@@ -24,3 +24,9 @@ Thumbs.db
 .env.local
 *.env
 !*.env.example
+
+# Runtime logs
+logs/
+
+# Per-OS venvs
+.venv-*
